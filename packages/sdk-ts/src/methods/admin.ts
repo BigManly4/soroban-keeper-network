@@ -1,94 +1,124 @@
-import { Keypair } from "@stellar/stellar-sdk";
-import type { ContractInvoker } from "../core/contractInvoker.js";
-import { toBigInt } from "../core/numbers.js";
-import { addressToScVal, i128ToScVal, u32ToScVal } from "../core/scval.js";
-import { InvalidFeeBpsError, NotInitializedError } from "../errors.js";
-import type { IntegerInput } from "../types.js";
-
 /**
- * Single-auth admin controls: one admin signature, one stored value
- * changes, one event fires. See methods/adminDualAuth.ts for the admin
- * methods that require two signatures.
+ * The single-auth admin controls: one admin signature, one stored value
+ * changes. `pause`/`unpause` are the emergency circuit breaker, `set_fee_bps`
+ * and `set_min_reward` the two tunable policy knobs.
+ *
+ * The dual-auth admin methods (`transfer_admin`, `sweep_fees`) need a second
+ * signature and live separately -- see backlog 0155.
  */
 
-export interface PauseArgs {
-  admin: Keypair;
+import type { ContractCaller, SignedCallOptions } from "../core/caller.js";
+import type { IntegerInput } from "../core/scval.js";
+import { addressArg, i128Arg, u32Arg } from "../core/scval.js";
+import { KeeperContractError, KeeperErrorCode } from "../errors.js";
+
+/** Shared by every entry point here: the admin authorizes, and is the source. */
+export interface AdminCallParams extends SignedCallOptions {
+  /** `G...` address stored as the registry's admin. Must authorize the call. */
+  admin: string;
 }
 
-export interface UnpauseArgs {
-  admin: Keypair;
-}
-
-export interface SetFeeBpsArgs {
-  admin: Keypair;
+export interface SetFeeBpsParams extends AdminCallParams {
+  /** New protocol fee in basis points, `0`..`10_000` inclusive. */
   newBps: number;
 }
 
-export interface SetMinRewardArgs {
-  admin: Keypair;
+export interface SetMinRewardParams extends AdminCallParams {
+  /** New reward floor in the reward token's own units. `i128`, so `bigint`. */
   minReward: IntegerInput;
 }
 
+/** The contract's own ceiling on `set_fee_bps`: 10,000 bps == 100%. */
 const MAX_FEE_BPS = 10_000;
 
 /**
- * The contract's `require_admin` returns the same `Unauthorized` error
- * whether the caller is simply the wrong address or whether the registry
- * has never been initialized (no admin stored yet) — see `require_admin`
- * in contracts/keeper-registry/src/lib.rs. This cheap read call lets the
- * SDK tell those two outcomes apart for the caller, throwing
- * `NotInitializedError` up front instead of a `KeeperContractError` whose
- * `Unauthorized` code could mean either.
+ * Distinguishes "you are not the admin" from "there is no admin yet".
+ *
+ * The contract's `require_admin` returns `Unauthorized` for both -- a wrong
+ * caller and a registry that was never initialized collapse into the same
+ * discriminant (see `contracts/keeper-registry/src/lib.rs`). One cheap `admin`
+ * simulation, which costs nothing and needs no signer, tells them apart, so a
+ * caller who simply pointed the SDK at an undeployed-into registry gets
+ * `NotInitialized` instead of being told their key is wrong.
+ *
+ * This is a diagnostic, not a security check: the contract still enforces
+ * authorization itself, and a registry initialized between this read and the
+ * call below just falls through to the contract's own verdict.
  */
-async function requireInitialized(invoker: ContractInvoker): Promise<void> {
-  const currentAdmin = await invoker.read<string | undefined>("admin", [], (v) => v as string | undefined);
-  if (currentAdmin === undefined) {
-    throw new NotInitializedError();
+async function requireInitialized(caller: ContractCaller, method: string): Promise<void> {
+  const currentAdmin = await caller.read<string | undefined>("admin");
+  if (currentAdmin === undefined || currentAdmin === null) {
+    throw new KeeperContractError(
+      KeeperErrorCode.NotInitialized,
+      `${method} requires an initialized registry, but no admin is configured. Call initialize first.`,
+      { local: true },
+    );
   }
 }
 
-/** Admin emergency circuit breaker — blocks register/claim/execute while paused. */
-export async function pause(invoker: ContractInvoker, { admin }: PauseArgs): Promise<void> {
-  await requireInitialized(invoker);
-  await invoker.write<void>("pause", [addressToScVal(admin.publicKey())], admin, () => undefined);
+/** Pauses the registry: blocks register, claim, and execute until unpaused. */
+export async function pause(caller: ContractCaller, params: AdminCallParams): Promise<void> {
+  await adminCall(caller, "pause", params, []);
 }
 
 /** Lifts a pause set by {@link pause}. */
-export async function unpause(invoker: ContractInvoker, { admin }: UnpauseArgs): Promise<void> {
-  await requireInitialized(invoker);
-  await invoker.write<void>("unpause", [addressToScVal(admin.publicKey())], admin, () => undefined);
+export async function unpause(caller: ContractCaller, params: AdminCallParams): Promise<void> {
+  await adminCall(caller, "unpause", params, []);
 }
 
 /**
- * Sets the platform fee. `newBps` is checked against the 10,000 (100%)
- * bound client-side before any network call — the contract enforces the
- * same bound (`InvalidFeeBps`), but there is no reason to pay a simulation
- * round trip for a value that can never succeed.
+ * Sets the protocol fee withheld from each executed task's reward.
+ *
+ * `newBps` is checked against the contract's own 10,000 bound locally, before
+ * any network call: the contract rejects the same values with `InvalidFeeBps`,
+ * and there is no reason to pay a simulation round trip for a value that can
+ * never succeed. Exactly 10,000 is legal and goes to the network; 10,001 does
+ * not. The rejection carries the same code the contract would have returned,
+ * with `local` set, so a caller branching on `KeeperErrorCode.InvalidFeeBps`
+ * handles both paths identically.
  */
-export async function setFeeBps(invoker: ContractInvoker, { admin, newBps }: SetFeeBpsArgs): Promise<void> {
+export async function setFeeBps(caller: ContractCaller, params: SetFeeBpsParams): Promise<void> {
+  const { newBps } = params;
   if (!Number.isInteger(newBps) || newBps < 0 || newBps > MAX_FEE_BPS) {
-    throw new InvalidFeeBpsError(newBps);
+    throw new KeeperContractError(
+      KeeperErrorCode.InvalidFeeBps,
+      `newBps must be a whole number of basis points between 0 and ${MAX_FEE_BPS}, got ${newBps}.`,
+      { local: true },
+    );
   }
-  await requireInitialized(invoker);
-  await invoker.write<void>(
-    "set_fee_bps",
-    [addressToScVal(admin.publicKey()), u32ToScVal(newBps)],
-    admin,
-    () => undefined
-  );
+  await adminCall(caller, "set_fee_bps", params, [u32Arg(newBps, "newBps")]);
 }
 
-/** Sets the minimum reward a task may be registered with (future registrations only). */
+/**
+ * Sets the smallest reward a task may be registered with.
+ *
+ * Applies to future registrations only; tasks already on-chain keep whatever
+ * reward they were registered with.
+ */
 export async function setMinReward(
-  invoker: ContractInvoker,
-  { admin, minReward }: SetMinRewardArgs
+  caller: ContractCaller,
+  params: SetMinRewardParams,
 ): Promise<void> {
-  const minRewardBig = toBigInt(minReward, "minReward");
-  await requireInitialized(invoker);
-  await invoker.write<void>(
-    "set_min_reward",
-    [addressToScVal(admin.publicKey()), i128ToScVal(minRewardBig)],
-    admin,
-    () => undefined
-  );
+  await adminCall(caller, "set_min_reward", params, [i128Arg(params.minReward, "minReward")]);
+}
+
+/**
+ * The shape every entry point above shares: check the registry is initialized,
+ * then invoke with the admin as both the authorizing address and the source.
+ */
+async function adminCall(
+  caller: ContractCaller,
+  method: string,
+  { admin, signer }: AdminCallParams,
+  extraArgs: ReturnType<typeof addressArg>[],
+): Promise<void> {
+  // Encode before the read so a malformed address fails without a round trip.
+  const adminArg = addressArg(admin, "admin");
+  await requireInitialized(caller, method);
+  await caller.invoke<void>({
+    method,
+    source: admin,
+    args: [adminArg, ...extraArgs],
+    ...(signer ? { signer } : {}),
+  });
 }
