@@ -1,42 +1,100 @@
-import { Address, Keypair, authorizeEntry, xdr } from "@stellar/stellar-sdk";
+/**
+ * Soroban auth-entry signing, for the one entry point in this contract that
+ * needs more than one signature.
+ *
+ * `transfer_admin` calls `require_auth` on both the outgoing and the incoming
+ * admin (see `contracts/keeper-registry/src/lib.rs`), so the transaction
+ * envelope's own signature -- which satisfies only the source account -- is not
+ * enough. Every other entry point is single-auth and goes through the client's
+ * ordinary `invoke`.
+ *
+ * The matching logic lives here, network-free and given only already-fetched
+ * simulation output, so "does every required address have a signer" can be
+ * exercised directly in tests without a live RPC server.
+ */
+
+import { Address, authorizeEntry, hash, xdr } from "@stellar/stellar-sdk";
+
+import { KeeperSdkError } from "../errors.js";
 
 /**
- * Signs whichever entries in `authEntries` require an explicit address
- * signature, matching each to a signer in `signers` by public key. Entries
- * whose credentials are implicit (`sorobanCredentialsSourceAccount` — i.e.
- * satisfied by the transaction envelope's own signature rather than a
- * separate auth entry) pass through untouched.
+ * Signs one Soroban authorization entry on behalf of one address.
  *
- * Kept as a standalone, network-free function — given only already-fetched
- * simulation output — so the "does every required address have a matching
- * signer" logic that `writeMultiAuth` depends on can be exercised directly
- * in tests without a live RPC server.
+ * Separate from {@link TransactionSigner} because the two sign different
+ * things: a `TransactionSigner` signs a transaction envelope, while this signs
+ * the auth-entry preimage. A wallet that exposes only envelope signing cannot
+ * satisfy a second required address, which is why this is its own interface
+ * rather than a widening of the existing one.
+ */
+export interface AuthEntrySigner {
+  /** `G...` address whose authorization this signer provides. */
+  readonly publicKey: string;
+  /** Signs the entry's `HashIdPreimage`. */
+  signAuthEntry(preimage: xdr.HashIdPreimage): Promise<Buffer> | Buffer;
+}
+
+/** Minimal `Keypair` surface, so callers need not import the class type. */
+interface KeypairLike {
+  publicKey(): string;
+  sign(data: Buffer): Buffer;
+}
+
+/**
+ * Adapts a `Keypair` to an {@link AuthEntrySigner}, mirroring `keypairSigner`
+ * for the envelope case.
+ */
+export function keypairAuthSigner(keypair: KeypairLike): AuthEntrySigner {
+  return {
+    publicKey: keypair.publicKey(),
+    signAuthEntry(preimage) {
+      return keypair.sign(hash(preimage.toXDR()));
+    },
+  };
+}
+
+/**
+ * Signs whichever of `entries` require an explicit address signature, matching
+ * each to a signer by public key.
  *
- * Throws if any entry requires an address for which no signer was supplied.
+ * An entry whose credentials are `sorobanCredentialsSourceAccount` is satisfied
+ * by the envelope signature the client already applies, so it passes through
+ * untouched -- signing it again would be wrong, not merely redundant.
+ *
+ * Throws if an entry requires an address no signer covers. That is caught here,
+ * before submission, because the alternative is a transaction that is valid,
+ * costs a fee, and fails `require_auth` for a reason invisible in the result.
  */
 export async function signAuthEntries(
-  authEntries: readonly xdr.SorobanAuthorizationEntry[],
-  signers: readonly Keypair[],
+  entries: readonly xdr.SorobanAuthorizationEntry[],
+  signers: readonly AuthEntrySigner[],
   validUntilLedgerSeq: number,
   networkPassphrase: string,
-  methodLabel = "call"
+  method: string,
 ): Promise<xdr.SorobanAuthorizationEntry[]> {
-  const signerByAddress = new Map(signers.map((s) => [s.publicKey(), s]));
+  const signerByAddress = new Map(signers.map((signer) => [signer.publicKey, signer]));
 
   return Promise.all(
-    authEntries.map(async (entry) => {
-      if (entry.credentials().switch() !== xdr.SorobanCredentialsType.sorobanCredentialsAddress()) {
+    entries.map(async (entry) => {
+      if (
+        entry.credentials().switch() !== xdr.SorobanCredentialsType.sorobanCredentialsAddress()
+      ) {
         return entry;
       }
-      const requiredAddress = Address.fromScAddress(entry.credentials().address().address()).toString();
-      const matching = signerByAddress.get(requiredAddress);
-      if (!matching) {
-        throw new Error(
-          `${methodLabel}: transaction requires authorization from ${requiredAddress}, ` +
-            `but no signer for that address was provided`
+
+      const required = Address.fromScAddress(entry.credentials().address().address()).toString();
+      const signer = signerByAddress.get(required);
+      if (!signer) {
+        throw new KeeperSdkError(
+          `${method} requires authorization from ${required}, but no signer for that address was supplied.`,
         );
       }
-      return authorizeEntry(entry, matching, validUntilLedgerSeq, networkPassphrase);
-    })
+
+      return authorizeEntry(
+        entry,
+        async (preimage) => signer.signAuthEntry(preimage),
+        validUntilLedgerSeq,
+        networkPassphrase,
+      );
+    }),
   );
 }
