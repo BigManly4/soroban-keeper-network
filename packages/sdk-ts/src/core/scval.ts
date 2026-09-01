@@ -63,11 +63,23 @@ export function toBigInt(value: IntegerInput, label: string): bigint {
 }
 
 /**
- * Converts an `i128` argument, accepting a `bigint` or a safe `number`.
+ * Converts a `u32` argument.
  *
- * Identical to the helper added alongside the single-auth admin methods
- * (#230); whichever of the two lands second should drop its copy.
+ * `u32` stays a plain `number` per the numeric convention, so this rejects a
+ * non-integer or out-of-range value rather than letting `nativeToScVal` coerce
+ * it -- a fee in basis points that silently wrapped would be a real loss.
  */
+export function u32Arg(value: number, label: string): xdr.ScVal {
+  if (!Number.isInteger(value)) {
+    throw new KeeperSdkError(`${label} must be an integer, got ${value}.`);
+  }
+  if (value < 0 || value > 4_294_967_295) {
+    throw new KeeperSdkError(`${label} exceeds the contract's u32 range, got ${value}.`);
+  }
+  return nativeToScVal(value, { type: "u32" });
+}
+
+/** Converts an `i128` argument, accepting a `bigint` or a safe `number`. */
 export function i128Arg(value: IntegerInput, label: string): xdr.ScVal {
   return nativeToScVal(toBigInt(value, label), { type: "i128" });
 }
@@ -81,9 +93,7 @@ export function i128Arg(value: IntegerInput, label: string): xdr.ScVal {
  */
 export function bytesN32Arg(value: Uint8Array, label: string): xdr.ScVal {
   if (value.length !== 32) {
-    throw new KeeperSdkError(
-      `${label} must be exactly 32 bytes, got ${value.length}.`,
-    );
+    throw new KeeperSdkError(`${label} must be exactly 32 bytes, got ${value.length}.`);
   }
   return xdr.ScVal.scvBytes(Buffer.from(value));
 }

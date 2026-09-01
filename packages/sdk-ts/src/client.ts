@@ -36,6 +36,12 @@ import type {
   UpgradeParams,
 } from "./methods/adminDualAuth.js";
 import { sweepFees, transferAdmin, upgrade } from "./methods/adminDualAuth.js";
+import type {
+  AdminCallParams,
+  SetFeeBpsParams,
+  SetMinRewardParams,
+} from "./methods/admin.js";
+import { pause, setFeeBps, setMinReward, unpause } from "./methods/admin.js";
 
 /**
  * The subset of `rpc.Server` this SDK uses.
@@ -214,6 +220,26 @@ export class KeeperRegistryClient implements ContractCaller {
   /** See {@link sweepFees}. */
   sweepFees(params: SweepFeesParams): Promise<void> {
     return sweepFees(this, params);
+  }
+
+  /** See {@link pause}. */
+  pause(params: AdminCallParams): Promise<void> {
+    return pause(this, params);
+  }
+
+  /** See {@link unpause}. */
+  unpause(params: AdminCallParams): Promise<void> {
+    return unpause(this, params);
+  }
+
+  /** See {@link setFeeBps}. */
+  setFeeBps(params: SetFeeBpsParams): Promise<void> {
+    return setFeeBps(this, params);
+  }
+
+  /** See {@link setMinReward}. */
+  setMinReward(params: SetMinRewardParams): Promise<void> {
+    return setMinReward(this, params);
   }
 
   /** See {@link withdrawRewards}. */
